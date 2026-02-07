@@ -1,273 +1,132 @@
-# Parking Lot System — Low-Level Design ✅🔧
+# Parking Lot System — Low-Level Design
 
-**Summary:** Design a SOLID, testable backend for a smart parking lot that handles entry/exit, spot allocation, real-time availability, and fee calculation. This is a design doc (no DB wiring required) covering data model, APIs, algorithms, concurrency, and extensibility.
+A SOLID-driven, testable backend for a smart parking lot: spot allocation, entry/exit, fees, real-time availability. No DB or external infra required.
 
----
-
-## 1) Goals & Constraints 🎯
-
-- **Functional:** allocate spots by vehicle size, record entry/exit, calculate fees, update availability in real time.
-- **Non-functional:** correctness under concurrency, low-latency allocation, extensible (new vehicle types, fee policies), observable and testable.
-- **Assumptions:** floors organized into rows/lanes, spot sizes enum `{MOTORCYCLE, COMPACT, REGULAR, LARGE, BUS}`, payment handled externally (we return fee), billing rules configurable.
+**Quick start**
+- Install: `npm install`
+- Demo: `npm run dev`
+- Tests: `npm test`
 
 ---
 
-## 2) Domain Model (Entities) 📦
-
-- **ParkingLot** (id, name, location)
-- **Floor** (id, parking_lot_id, level)
-- **ParkingSpot** (id, floor_id, code, size, status {AVAILABLE, OCCUPIED, RESERVED}, distance_rank)
-- **Vehicle** (id, plate_number, type)
-- **ParkingSession / Ticket** (id, vehicle_id, spot_id, entry_time, exit_time, status, billed_amount, version)
-- **Rate** (id, vehicle_type, base_amount, per_hour, grace_period_minutes)
-- **PaymentTransaction** (id, session_id, amount, paid_at, status)
-
-> Relational model: `parking_spot` -> `floor`, `parking_session` -> `spot` & `vehicle`.
+## Goals
+- **Functional:** allocate spots by vehicle size, track entry/exit, calculate fees, update availability in real-time.
+- **Non-functional:** concurrent safety, low-latency, extensible fee/vehicle types, testable.
+- **Vehicle types:** motorcycle, car, bus. **Storage:** UTC timestamps, configurable grace periods.
 
 ---
 
-## 3) Database Schema (Representative SQL) 💾
+## Domain Model
+**Entities:** ParkingLot → Floor → ParkingSpot, Vehicle, ParkingSession (entry/exit times + fee), Rate (per vehicle type), PaymentTransaction, Reservation (with TTL).
 
+**Spot status:** AVAILABLE | RESERVED | OCCUPIED
+
+---
+
+## Database Schema (Key Tables)
 ```sql
-CREATE TABLE vehicle_type (
-  id SERIAL PRIMARY KEY,
-  name TEXT UNIQUE
-);
-
-CREATE TABLE parking_spot (
-  id BIGSERIAL PRIMARY KEY,
-  floor_id BIGINT NOT NULL,
-  code TEXT NOT NULL,
-  size TEXT NOT NULL, -- same as vehicle_type
-  status TEXT NOT NULL DEFAULT 'AVAILABLE', -- AVAILABLE|OCCUPIED|RESERVED
-  distance_rank INT NOT NULL,
-  CONSTRAINT uq_floor_code UNIQUE (floor_id, code)
-);
-
-CREATE TABLE vehicle (
-  id BIGSERIAL PRIMARY KEY,
-  plate VARCHAR(20) UNIQUE NOT NULL,
-  type TEXT NOT NULL
-);
-
-CREATE TABLE parking_session (
-  id BIGSERIAL PRIMARY KEY,
-  vehicle_id BIGINT REFERENCES vehicle(id),
-  spot_id BIGINT REFERENCES parking_spot(id),
-  entry_time TIMESTAMP NOT NULL,
-  exit_time TIMESTAMP,
-  billed_amount DECIMAL(10,2),
-  status TEXT NOT NULL, -- ACTIVE|CLOSED|CANCELLED
-  version INT DEFAULT 0 -- optimistic locking
-);
-
-CREATE TABLE rate (
-  id BIGSERIAL PRIMARY KEY,
-  vehicle_type TEXT NOT NULL,
-  base_amount DECIMAL,
-  per_hour DECIMAL,
-  grace_period_minutes INT
-);
+CREATE TABLE parking_spot (id, floor_id, code, size, status, distance_rank);
+CREATE TABLE vehicle (id, plate, type);
+CREATE TABLE parking_session (id, vehicle_id, spot_id, entry_time, exit_time, billed_amount, version);
+CREATE TABLE rate (id, vehicle_type, base_amount, per_hour, grace_period_minutes);
+CREATE TABLE parking_reservation (id, spot_id, reserved_until, created_at);
 ```
-
-**Indexes:** `parking_spot (status, size, distance_rank)`, `parking_session (status, vehicle_id)`.
-
-**Additional DB tables:**
-```sql
-CREATE TABLE parking_lot (
-  id BIGSERIAL PRIMARY KEY,
-  name TEXT NOT NULL,
-  location TEXT
-);
-
-CREATE TABLE floor (
-  id BIGSERIAL PRIMARY KEY,
-  parking_lot_id BIGINT REFERENCES parking_lot(id),
-  level INT NOT NULL
-);
-
-CREATE TABLE parking_reservation (
-  id BIGSERIAL PRIMARY KEY,
-  spot_id BIGINT REFERENCES parking_spot(id),
-  reserved_by TEXT,
-  reserved_until TIMESTAMP WITH TIME ZONE NOT NULL,
-  created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now()
-);
-
-CREATE TABLE payment_transaction (
-  id BIGSERIAL PRIMARY KEY,
-  session_id BIGSERIAL REFERENCES parking_session(id),
-  amount DECIMAL(10,2) NOT NULL,
-  paid_at TIMESTAMP WITH TIME ZONE,
-  status TEXT NOT NULL
-);
-```
+**Indexes:** parking_spot(status, size, distance_rank), parking_session(status, vehicle_id), parking_reservation(reserved_until).
 
 ---
 
-## 4) Spot Allocation Algorithm 🔍
+## Spot Allocation Algorithm
+1. Map vehicle type → compatible spot sizes.
+2. Query first AVAILABLE spot ordered by distance_rank (min-heap priority queue).
+3. Lock spot atomically (DB transaction + SELECT FOR UPDATE).
+4. Create session, mark spot OCCUPIED.
+5. For buses: find contiguous segments (O(K) per lane).
 
-**Goals:** assign the fastest available suitable spot, prefer closest, support contiguous allocation for buses.
-
-**Data structures:**
-- For each spot size: an ordered set (min-heap / priority queue) keyed by `distance_rank` of `AVAILABLE` spots.
-- For buses: per-lane bitmaps or interval trees to find contiguous segments.
-
-**Algorithm (simple & robust):**
-1. Map vehicle -> compatible spot sizes (vehicle may fit in larger spots).
-2. Try smallest-compatible size: fetch first AVAILABLE spot from priority queue.
-3. Reserve with atomic operation: DB transaction + `SELECT ... FOR UPDATE` on chosen spot row or optimistic lock.
-4. Create `ParkingSession`, mark spot `RESERVED` -> `OCCUPIED` on commit.
-
-**Complexity:** O(log N) per lookup; contiguous search for buses typically O(K) where K is lane length.
+**Complexity:** O(log N) per lookup.
 
 ---
 
-## 5) Fee Calculation Logic 🧾 (Strategy Pattern)
-
-- Expose `IFeeCalculator` and implement `FlatPerHourCalculator`, `TieredCalculator`, etc.
-- Example formula: `totalHours = ceil((exit_time - entry_time - free_minutes)/60)` then `amount = base + totalHours * per_hour`.
-- Store rate data in `rate` table and keep calculaters pluggable.
-
----
-
-## 6) Concurrency & Consistency 🔐
-
-- Use DB row-level locking during allocation (`SELECT ... FOR UPDATE`) to prevent double allocation.
-- Optionally: distributed lock (Redis/RedLock) for higher-level coordination.
-- Use optimistic locking (version) on `ParkingSession` updates.
-- For high bursts: front-door queuing (Kafka/RabbitMQ) to serialize allocation attempts.
-- Ensure idempotency by checking plate + active session before creating a new session.
+## Fee Calculation (Strategy Pattern)
+- `IFeeCalculator` interface with pluggable implementations (FlatPerHour, Tiered, etc.).
+- Formula: `amount = base + ceil((duration_minutes - grace_minutes) / 60) * per_hour`.
+- Rate policies stored in DB, fetched by vehicle type.
 
 ---
 
-## 7) APIs (REST examples) 🌐
-
-- `POST /api/entry` -> { plate, vehicleType, preferred_floor? } -> 201 `{ ticketId, spot, entryTime }`
-- `POST /api/exit` -> { ticketId } -> 200 `{ ticketId, entryTime, exitTime, amount }`
-- `GET /api/spots/availability` -> `{ total, available, bySize }`
-- `GET /api/sessions/{ticketId}` -> full session
-
-**Realtime:** WebSocket / SSE at `/ws/availability` for push updates.
+## Concurrency & Consistency
+- **Allocation:** DB row-level lock (SELECT FOR UPDATE) within transaction to prevent double-allocation.
+- **Updates:** Optimistic locking (version column) on ParkingSession.
+- **High load:** Optional front-door queueing (Kafka/RabbitMQ) to serialize allocation.
+- **Idempotency:** Check plate + active session before creating new session.
 
 ---
 
-## 8) SOLID & Class Design (Interfaces + Implementations) 🧩
-
-**Key interfaces**
-- `IParkingSpotAllocator { allocate(vehicle): ParkingSpot | throws NoSpace }`
-- `IFeeCalculator { calculate(session): Money }`
-- `IParkingSessionRepository { create(session), close(session) }`
-- `IParkingSpotRepository { findAvailableBySize(size), markReserved(spot), markAvailable(spot) }`
-
-**Notes:**
-- `SimpleAllocator` implements `IParkingSpotAllocator` (single responsibility).
-- `FeeCalculatorFactory` returns `IFeeCalculator` for type (open to new strategies).
-- `ParkingService` depends on abstractions (dependency injection).
-
-**SOLID mapping:** SRP, OCP, LSP, ISP, DIP followed.
+## APIs (REST)
+- `POST /api/entry` { plate, vehicleType } → 201 { ticketId, spotId, entryTime }
+- `POST /api/exit` { ticketId } → 200 { ticketId, amount, exitTime }
+- `GET /api/spots/availability` → { total, available, bySize }
+- `WS /ws/availability` — push availability updates (WebSocket/SSE)
 
 ---
 
-## 9) Flow Diagrams (Summary) 🔁
+## SOLID & Class Design
+**Key interfaces:**
+- `IParkingSpotAllocator` — allocate(vehicle): ParkingSpot
+- `IFeeCalculator` — calculate(session): number
+- `IParkingSpotRepository` — find/mark available/reserved
+- `IParkingSessionRepository` — create/close sessions
 
-**Entry flow:**
-1. API `/entry` receives request.
-2. Validate vehicle; check active session.
-3. Call `IParkingSpotAllocator.allocate(vehicle)`.
-4. In transaction: `SELECT FOR UPDATE` and mark spot `RESERVED`.
-5. Create `ParkingSession` (ACTIVE).
-6. Emit `availability.update` event.
+**Classes:** SimpleAllocator, FlatPerHourCalculator, FeeCalculatorFactory, ParkingService (high-level coordinator).
 
-**Exit flow:**
-1. `/exit` receives ticket.
-2. Compute fee via `IFeeCalculator`.
-3. Mark session CLOSED, spot -> AVAILABLE (transactional).
-4. Emit `availability.update`.
+**Follows:** SRP, OCP, LSP, ISP, DIP.
 
 ---
 
-## 10) Real-time Availability & Events 🔄
+## Flows (High-Level)
+**Entry:** Client → API.entry → Allocator.allocate → lock spot → create session → publish availability update
 
-- Use Redis Pub/Sub or Kafka for events: `availability.update`, `session.created`, `session.closed`.
-- WebSocket gateway subscribes and forwards to clients.
-- Cache availability in Redis for fast reads.
-
----
-
-## 11) Monitoring, Testing, & Observability 📊
-
-- **Metrics:** allocation latency, success rate, occupancy per floor, queue length.
-- **Logs:** structured logs with `correlationId`.
-- **Tracing:** distributed tracing for entry/exit flows.
-- **Tests:** unit (allocators, calculators), integration (DB transactions, concurrency), load tests for contention.
-
-**Security & Timezone (Operational notes):**
-- Timezone policy: store all timestamps in UTC (`TIMESTAMP WITH TIME ZONE`) and perform client-side conversion; include timezone info in logs and traces.
-- API Security: protect APIs with authentication (JWT or API keys) and RBAC for admin operations; validate inputs and use idempotency tokens for entry/exit to prevent duplicate processing.
-- Audit trail: maintain immutable audit logs for session/reservation changes (entry, exit, reservation, cancellation) for forensic needs.
+**Exit:** Client → API.exit → FeeCalculator.calculate → charge payment → close session → release spot → publish availability update
 
 ---
 
-## 12) Edge Cases & Tradeoffs ⚠️
-
-- Simultaneous arrivals: handled via DB locks or queueing.
-- Lost ticket: plate-based reconciliation.
-- Partial failures: ensure release of reserved spot in finally block/compensating transaction.
-- Bus allocation: contiguous segment search adds complexity; consider dedicated bus lanes.
-
-### Reservation lifecycle & failure recovery
-
-- Reservations: when a spot is `RESERVED` create a `parking_reservation` record with `reserved_until` (TTL). A background sweeper (in-memory timer or scheduled job) releases expired reservations by marking the spot `AVAILABLE`.
-- Reservation expiration policy: default TTL configurable (e.g., 5 minutes). If reservation not confirmed by session creation within TTL, it is released automatically.
-- Partial failures & compensations: perform allocation and session creation as an atomic operation where possible. If the system marks a spot `OCCUPIED` but fails to create a session (or fails later during checkout), use a compensating action to set the spot back to `AVAILABLE` and record the incident. For non-transactional steps (external payment), apply a Saga/compensation pattern: if payment fails after closing a session, cancel session or retry payment and free spot accordingly.
-- Idempotency & retries: use idempotency keys (ticketId or plate) for entry/exit endpoints; retries should detect and handle duplicate requests safely.
+## Real-time Availability & Events
+- **Pub/Sub:** Redis or Kafka publish `availability.update`, `session.created`, `session.closed` events.
+- **WebSocket gateway** subscribes and broadcasts to clients.
+- **Cache:** Redis for fast availability reads (eventual consistency acceptable).
 
 ---
 
-## 13) Extensibility & Future Enhancements ✨
-
-- Reservation/pre-booking with expiry.
-- Dynamic pricing (time-of-day, occupancy-based).
-- Camera/ANPR integration for automated check-in/out.
-- Mobile notifications and itemized receipts.
-
----
-
-## 14) Example Implementation Notes (Pseudocode)
-
-- Allocation with DB transaction:
-```pseudo
-start transaction
-SELECT id FROM parking_spot
- WHERE size IN (...) AND status='AVAILABLE'
- ORDER BY distance_rank LIMIT 1 FOR UPDATE
-IF row found:
-  UPDATE status='OCCUPIED'
-  INSERT parking_session
-  commit
-ELSE
-  rollback -> return no space
-```
+## Testing & Observability
+- **Unit tests:** allocator, fee calculator (Jest in `tests/`)
+- **Integration tests:** DB transactions, concurrent allocation
+- **Metrics:** allocation latency, success rate, occupancy, queue length
+- **Logs:** structured with correlationId
+- **Timezone:** Store UTC, convert on client. Use idempotency tokens for entry/exit (prevent duplicates).
 
 ---
 
-## 15) Final Recommendations ✅
-
-1. Start with DB locking model (`SELECT FOR UPDATE`) and add distributed locks only if needed.
-2. Keep fee calculation pluggable and configurable in DB.
-3. Use Redis for fast availability reads and pub/sub to push updates.
-4. Add thorough concurrent integration tests early.
+## Edge Cases & Resilience
+- **Concurrent arrivals:** DB locks or queueing serializes safely.
+- **Reservation TTL:** background sweeper releases expired reservations (configurable, e.g., 5 min).
+- **Partial failures:** compensating actions release spots, saga pattern for payment retries.
+- **Lost ticket:** plate-based reconciliation lookup.
+- **Payment failure:** retry or mark session for manual review.
 
 ---
 
-## Thoughts & Suggestions — Short & Actionable 💡
+## Future Enhancements
+- Pre-booking / reservations with expiry
+- Dynamic pricing (time-of-day, occupancy-based)
+- Camera/ANPR integration for automated check-in
+- Mobile push notifications, receipts
 
-- **Solid foundation:** The doc is well-structured, follows SOLID principles, and separates responsibilities clearly — great for testable, maintainable code.
-- **Add diagrams & API contract:** Include UML class/sequence diagrams and an OpenAPI spec to make the design unambiguous for implementers.
-- **Expand failure and consistency strategies:** Add specifics for compensating transactions, retry/backoff policies, and how to reconcile caches after partial failures.
-- **Add examples & policies:** Put sample rate policies, rounding rules, and example fee calculations (edge cases) so business rules are explicit.
-- **Prioritize tests:** Add concurrency stress tests (multiple threads/processes) to validate locks and queueing under load.
+---
+
+## Recommendations
+1. Start with DB locking (SELECT FOR UPDATE); add distributed locks only if contention appears.
+2. Keep fee calc pluggable and rate policies in DB.
+3. Use Redis for fast availability reads + pub/sub for updates.
+4. Add concurrency stress tests early.
 
 ---
 
@@ -373,15 +232,26 @@ sequenceDiagram
 
 ---
 
-## Next Steps 🔭
-
-If you want, I can:
-- generate UML class & sequence diagrams (files created under `diagrams/`),
-- create an OpenAPI (Swagger) spec for the APIs,
-- scaffold a small service skeleton with interfaces and unit tests.
-
-Tell me which one to produce next.
+## File Structure
+```
+src/
+  interfaces/ — allocator, feeCalculator contracts
+  dtos/ — vehicle, session, paymentRequest
+  services/ — simpleAllocator, flatFeeCalculator, feeCalculatorFactory, parkingService
+  infra/ — inMemoryRepos (spotRepo, sessionRepo)
+tests/
+  allocator.test.ts
+  feeCalculator.test.ts
+diagrams/
+  entry_sequence.mmd, exit_sequence.mmd, failure_sequence.mmd
+DESIGN.md — full design reference
+```
 
 ---
 
-*Document Generated:* `DESIGN.md` — created for the Parking Lot System project.
+## Done ✅
+- Low-level design with SOLID principles
+- TypeScript skeleton (interfaces, DTOs, services)
+- In-memory repositories
+- Unit tests (Jest)
+- Mermaid sequence diagrams (entry, exit, failure scenarios)
