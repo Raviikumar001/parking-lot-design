@@ -1,0 +1,37 @@
+sequenceDiagram
+  participant ClientA
+  participant ClientB
+  participant API
+  participant ParkingService
+  participant Allocator
+  participant SpotRepo
+  participant SessionRepo
+  participant Sweeper
+
+  ClientA->>API: POST /api/entry { plate: A }
+  API->>ParkingService: checkIn(A)
+  ClientB->>API: POST /api/entry { plate: B }
+  API->>ParkingService: checkIn(B)
+
+  alt concurrent allocation same spot
+    ParkingService->>Allocator: allocate(A)
+    ParkingService->>Allocator: allocate(B)
+    Allocator->>SpotRepo: try lock spot S1
+    SpotRepo-->>Allocator: S1 locked for A
+    Allocator-->>ParkingService: success (A->S1)
+    Allocator->>SpotRepo: try lock next spot for B
+    SpotRepo-->>Allocator: no available -> return NoSpace
+    Allocator-->>ParkingService: allocation failed (B)
+  end
+
+  Note over SpotRepo,Sweeper: Reservation TTL expires
+  Sweeper->>SpotRepo: release expired reservation S2
+  Sweeper-->>EventBus: publish availability.update
+  
+  alt payment/checkout fails
+    ParkingService->>SessionRepo: close(session)
+    ParkingService->>PaymentAdapter: charge
+    PaymentAdapter--x ParkingService: payment failed
+    ParkingService->>SessionRepo: mark session FAILED or queued-for-retry
+    ParkingService->>SpotRepo: optionally release spot
+  end

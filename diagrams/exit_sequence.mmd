@@ -1,0 +1,22 @@
+sequenceDiagram
+  participant Client
+  participant API
+  participant ParkingService
+  participant SessionRepo
+  participant FeeCalc
+  participant SpotRepo
+  participant EventBus
+  participant PaymentAdapter
+
+  Client->>API: POST /api/exit { ticketId }
+  API->>ParkingService: checkOut(ticketId)
+  ParkingService->>SessionRepo: fetch active session
+  SessionRepo-->>ParkingService: session (entryTime,...)
+  ParkingService->>FeeCalc: calculate(session)
+  FeeCalc-->>ParkingService: amount
+  ParkingService->>PaymentAdapter: request payment (amount)
+  PaymentAdapter-->>ParkingService: payment OK
+  ParkingService->>SessionRepo: close(session, exitTime, amount)
+  ParkingService->>SpotRepo: mark spot AVAILABLE
+  ParkingService->>EventBus: publish availability.update
+  API-->>Client: 200 { ticketId, amount, exitTime }

@@ -1,0 +1,22 @@
+sequenceDiagram
+  participant Client
+  participant API
+  participant ParkingService
+  participant Allocator
+  participant SpotRepo
+  participant SessionRepo
+  participant EventBus
+  participant WS
+
+  Client->>API: POST /api/entry { plate, vehicleType }
+  API->>ParkingService: checkIn(vehicle)
+  ParkingService->>Allocator: allocate(vehicle)
+  Allocator->>SpotRepo: findAvailable(size) / lock spot
+  SpotRepo-->>Allocator: spot (locked/reserved)
+  Allocator->>SessionRepo: create ParkingSession
+  SessionRepo-->>Allocator: session created
+  Allocator-->>ParkingService: chosen spot
+  ParkingService-->>API: 201 { ticketId, spot }
+  ParkingService->>EventBus: publish availability.update
+  EventBus->>WS: broadcast update to clients
+  API-->>Client: 201 { ticketId, spotId, entryTime }

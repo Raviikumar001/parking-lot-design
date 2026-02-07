@@ -1,0 +1,11 @@
+classDiagram
+  class ParkingService
+  class SimpleAllocator
+  class InMemorySpotRepo
+  class InMemorySessionRepo
+  class FlatPerHourCalculator
+
+  ParkingService --> SimpleAllocator
+  SimpleAllocator --> InMemorySpotRepo
+  SimpleAllocator --> InMemorySessionRepo
+  ParkingService --> FlatPerHourCalculator
